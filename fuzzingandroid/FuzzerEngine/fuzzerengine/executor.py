@@ -16,7 +16,8 @@ from collections import deque
 from adb_messages_queue import AdbMessagesQueue
 from sysevent_generator import SysEventGenerator
 from circular_restore_strategy import CircularRestoreStrategy
-
+from datetime import datetime
+from subprocess import call
 import coverage_manager
 
 import csv
@@ -112,24 +113,24 @@ class Executor:
         crash_t.setDaemon(True)
         crash_t.start()
     
-    def start_output(self):
+    def start_output(self, app_package_name, app_class_files_path):
         
-        output_t=threading.Thread(target=self.output)
+        output_t=threading.Thread(target=self.output, args=(app_package_name, app_class_files_path, ))
         output_t.setDaemon(True)
         output_t.start()
 
     
     
-    def run(self, app_name, recent_path_size, timeout):
+    def run(self, app_name, recent_path_size, timeout, app_class_files_path, login_script):
         
         #launching the app
-        self.init_app(app_name)
+        self.init_app(app_name, login_script)
         
         recent_path = deque(maxlen=recent_path_size)
         self.num_restore=0
         start_time=time.time()
         self.start_sys_event_generator()
-        self.start_output()
+        self.start_output(app_name, app_class_files_path)
 
         while (time.time() - start_time) < timeout:
 
@@ -138,10 +139,12 @@ class Executor:
             monkey_watcher=self.start_monkey(app_name)
             self.start_crash_watcher() 
             
-            self.start_exec(log_proc,monkey_watcher,recent_path,recent_path_size)
+            self.start_exec(log_proc,monkey_watcher,recent_path,recent_path_size, app_name, app_class_files_path)
 
-            coverage_manager.pull_coverage_files(self.num_restore)
-            coverage_manager.compute_current_coverage()
+            coverage_manager.pull_coverage_files(self.num_restore, app_name, app_class_files_path,
+                                                 vm.VM.ip + ':' + vm.VM.adb_port)
+
+            coverage_manager.compute_current_coverage(app_class_files_path)
             current_coverage = coverage_manager.read_current_coverage()
             print "--the current line coverage : " + str(current_coverage)
 
@@ -164,7 +167,7 @@ class Executor:
         self.monkey_controller.kill_monkey()
 
 
-    def start_exec(self, log_proc, monkey_watcher, recent_path, recent_path_size):
+    def start_exec(self, log_proc, monkey_watcher, recent_path, recent_path_size, app_package_name, app_class_files_path):
         
         current_coverage = coverage_manager.read_current_coverage()
         event_num=0    
@@ -177,13 +180,16 @@ class Executor:
             if log_proc.poll() != None or not monkey_watcher.isAlive():
                 print "no app info in logs ---"
                 break
-            
-            if log_watcher.poll(1):
-               line=log_proc.stdout.readline()
-            else:
-               continue
 
-        
+            try:
+                if log_watcher.poll(1):
+                   line=log_proc.stdout.readline()
+                else:
+                   continue
+            except select.error:
+                print "ting: select.error catched!"
+                pass
+
             #parsing the line, skip if the line is empty or there is no state_id
             state_info = self.parse_line(line)
             if state_info is None:
@@ -235,8 +241,10 @@ class Executor:
                     parent = self.state_graph.retrieve(self.state_id_being_fuzzed)
                     child = self.state_graph.retrieve(id)
                     
-                    coverage_manager.pull_coverage_files("temp")
-                    coverage_manager.compute_current_coverage()             # output in coverage.txt
+                    coverage_manager.pull_coverage_files("temp", app_package_name, app_class_files_path,
+                                                         vm.VM.ip + ':' + vm.VM.adb_port)
+
+                    coverage_manager.compute_current_coverage(app_class_files_path)  # output in coverage.txt
                     new_coverage = coverage_manager.read_current_coverage()
                     print "--coverage when the new state is triggered: " + str(new_coverage) + " current coverage: " + str(current_coverage)
                     
@@ -277,21 +285,46 @@ class Executor:
     def bring_app_to_front(self,pkg_name):
 
         try:
-            cmd="adb -s " + vm.VM.ip+ ":"+vm.VM.adb_port +" shell dumpsys activity recents | grep realActivity="+ pkg_name + "  | cut -d'=' -f2 | xargs adb shell am start "
+            cmd="adb -s " + vm.VM.ip+ ":"+vm.VM.adb_port +" shell dumpsys activity recents | grep realActivity="+ pkg_name + "  | cut -d'=' -f2 | xargs adb -s " + vm.VM.ip+ ":"+vm.VM.adb_port + " shell am start "
             os.system(cmd + " > /dev/null 2>&1")
         except Exception, e:
             print "resumed app failed."
 
 
-    def init_app(self, app_name):
+    def init_app(self, app_name, login_script):
 
         print "launching app under test..."
-        os.system("adb shell monkey -p " + app_name + "  1") 
+        cmd="adb -s " + vm.VM.ip + ':' + vm.VM.adb_port + " shell monkey -p " + app_name + "  1"
+        print cmd
+        while True:
+            p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            output = str(p.stdout.read()).strip()
+            if "No activities found to run" in output:
+                print "ERROR: launch failed! Try Again!"
+                time.sleep(5)
+            elif "Events injected" in output:
+                print "SUCCESS: app is launched!"
+                break
+            else:
+                print "New Message"
+                break
+            #os.system("adb -s " + vm.VM.ip + ':' + vm.VM.adb_port + " shell monkey -p " + app_name + "  1")
         print "takes a while to complete starting animation ..."
         time.sleep(5)
 
         self.bring_app_to_front(self.pkg_name)
         time.sleep(5)
+
+
+        # Ting: add login code
+        if login_script != "":
+            print "Start to login:"
+            login_cmd = "python3 " + login_script + " " + vm.VM.ip + ':' + vm.VM.adb_port + " timemachine"
+            print "--------"
+            print login_cmd
+            print "--------"
+            call(login_cmd, shell=True)
+
         print "--taking snapshot for the initial state..."
         self.state_graph.add_node("INITIAL")
         self.vm.take_snapshot("INITIAL", "", True)
@@ -336,7 +369,7 @@ class Executor:
 
         return info
     
-    def output(self):
+    def output(self, app_package_name, app_class_files_path):
         
         with open(RunParameters.OUTPUT_FILE, "a") as csv_file:
             writer = csv.writer(csv_file, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
@@ -349,8 +382,10 @@ class Executor:
                         num_snapshots = num_snapshots+1
                 
                 #read coverage
-                coverage_manager.pull_coverage_files("temp")
-                coverage_manager.compute_current_coverage()             # output in coverage.txt
+                coverage_manager.pull_coverage_files("temp", app_package_name, app_class_files_path,
+                                                     vm.VM.ip + ':' + vm.VM.adb_port)
+
+                coverage_manager.compute_current_coverage(app_class_files_path)    # output in coverage.txt
                 current_coverage = coverage_manager.read_current_coverage()
 
                 # write files
@@ -364,7 +399,7 @@ class Executor:
 
     def dump_crash_logs(self):
         
-        cmd = "adb -s " + vm.VM.ip+ ":"+vm.VM.adb_port +"  logcat AndroidRuntime:E *:S"
+        cmd = "adb -s " + vm.VM.ip+ ":"+vm.VM.adb_port +"  logcat AndroidRuntime:E CrashAnrDetector:D System.err:W CustomActivityOnCrash:E ACRA:E WordPress-EDITOR:E *:F *:S"
         p = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE, universal_newlines=True, close_fds=True)
         fw = open(RunParameters.CRASH_FILE, "a")
         while True:
@@ -374,6 +409,10 @@ class Executor:
             if p.poll() != None:
                 print "crash watcher is termined..."
                 break
+
+        now = datetime.now()
+        current_time = now.strftime("%Y-%m-%d-%H:%M:%S")
+        fw.write("[" + current_time + "]" + "\n")
         fw.close()
 
 
@@ -386,9 +425,15 @@ if __name__ == '__main__':
 
     RunParameters.RUN_GUI = str(sys.argv[6])
 
+    APK_FILE_NAME = sys.argv[7]
+    if len(sys.argv) >=9:
+        LOGIN_SCRIPT = sys.argv[8]
+    else:
+        LOGIN_SCRIPT = ""
+
     RunParameters.OUTPUT_FILE= "../../output/"  +  "data.csv"
     RunParameters.CRASH_FILE= "../../output/" +  "crashes.log"
-
+    RunParameters.RUN_TIME_FILE = "../../output/" +  "run_time.log"
 
     machine = vm.VM(RunParameters.RUN_GUI, vm.VM.adb_port)  # headless or gui
 
@@ -403,10 +448,42 @@ if __name__ == '__main__':
 
     if RunParameters.OPEN_SOURCE:
 
-        os.system('adb -s ' + vm.VM.ip + ':' + vm.VM.adb_port + ' shell am instrument -e coverage true -w ' + RunParameters.RUN_PKG + '/.EmmaInstrument.EmmaInstrumentation &')
+        #os.system('adb -s ' + vm.VM.ip + ':' + vm.VM.adb_port + ' shell am instrument -e coverage true -w ' + RunParameters.RUN_PKG + '/.EmmaInstrument.EmmaInstrumentation &')
         time.sleep(5)
+
+    # Ting: get the class files path
+    APP_CLASS_FILES = "/root/app/class_files.json"
+    import json
+    tmp_file = open(APP_CLASS_FILES, "r")
+    tmp_file_dict = json.load(tmp_file)
+    tmp_file.close()
+    app_path_info_dict = tmp_file_dict[APK_FILE_NAME]
+    class_files_path_list = app_path_info_dict['classfiles']
+    CLASS_FILES_PATH = ""
+    for class_files_path in class_files_path_list:
+        CLASS_FILES_PATH += ' --classfiles ' + os.path.join('/root/app/', class_files_path)
+    print "CLASS_FILE_PATH: " + CLASS_FILES_PATH
+
+    # record testing starting time
+    fw = open(RunParameters.RUN_TIME_FILE, "a")
+    now = datetime.now()
+    current_time = now.strftime("%Y-%m-%d-%H:%M:%S")
+    fw.write(current_time)
+    fw.close()
+
+    if LOGIN_SCRIPT != "":
+        # the app requires login script
+        script_file_name = os.path.basename(LOGIN_SCRIPT)
+        LOGIN_SCRIPT = os.path.join("/root/app/", script_file_name)
    
-    executor.run(RunParameters.RUN_PKG, 10, RunParameters.RUN_TIME)
+    executor.run(RunParameters.RUN_PKG, 10, RunParameters.RUN_TIME, CLASS_FILES_PATH, LOGIN_SCRIPT)
+
+    # record testing ending time
+    fw = open(RunParameters.RUN_TIME_FILE, "a")
+    now = datetime.now()
+    current_time = now.strftime("%Y-%m-%d-%H:%M:%S")
+    fw.write(current_time + "\n")
+    fw.close()
 
     graph.dump()
     machine.power_off_VM()
